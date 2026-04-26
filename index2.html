@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Soil Respiration Monitoring Dashboard</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import {
+            getDatabase,
+            ref,
+            onValue,
+            query,
+            orderByKey,
+            limitToLast,
+            get
+        } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+        const firebaseConfig = {
+            databaseURL: "https://soil-respiration-default-rtdb.asia-southeast1.firebasedatabase.app/"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getDatabase(app);
+
+        const latestRef = ref(db, "latest");
+        const fullHistoryRef = ref(db, "history");
+        const historyQuery = query(ref(db, "history"), orderByKey(), limitToLast(20));
+
+        const CO2_PPM_TO_MG_FACTOR = 0.00126;
+
+        let co2PpmChart;
+        let co2CumulativeChart;
+        let envChart;
+        let latestHistoryRows = [];
+
+        function setText(id, value) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        }
+
+        function setBar(id, value, label) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.style.width = `${value}%`;
+            el.textContent = label;
+        }
+
+        function formatStatus(co2, temp, hum, soil) {
+            if (co2 > 1200) return "Elevated carbon dioxide concentration detected.";
+            if (soil < 30) return "Low soil moisture detected.";
+            if (hum > 85) return "Outside humidity is high.";
+            if (temp > 35) return "Outside temperature is relatively high.";
+            return "System operating within expected conditions.";
+        }
+
+        function formatShortChartLabel(row, rows) {
+            const uniqueDates = [...new Set(rows.map(r => r.date).filter(Boolean))];
+
+            if (uniqueDates.length <= 1 && row.time) {
+                return row.time;
+            }
+
+            if (row.date && row.time) {
+                const shortDate = row.date.slice(5);
+                return `${shortDate} ${row.time}`;
+            }
+
+            return row.datetime || row.key;
+        }
+
+        function formatTimestampForFilename() {
+            const now = new Date();
+            const yyyy = now.getFullYear();
+            const mm = String(now.getMonth() + 1).padStart(2, "0");
+            const dd = String(now.getDate()).padStart(2, "0");
+            const hh = String(now.getHours()).padStart(2, "0");
+            const min = String(now.getMinutes()).padStart(2, "0");
+            const ss = String(now.getSeconds()).padStart(2, "0");
+            return `${yyyy}-${mm}-${dd}_${hh}-${min}-${ss}`;
+        }
+
+        function calculateCumulativeCo2Mg(rows) {
+            let cumulativeCo2Mg = 0;
+
+            return rows.map((row, index) => {
+                if (index === 0) {
+                    return {
+                        ...row,
+                        co2_mg: 0,
+                        cumulative_co2_mg: 0
+                    };
+                }
+
+                const previousPpm = Number(rows[index - 1].co2 ?? 0);
+                const latestPpm = Number(row.co2 ?? 0);
+
+                const co2Mg = Math.max((latestPpm - previousPpm) * CO2_PPM_TO_MG_FACTOR, 0);
+                cumulativeCo2Mg += co2Mg;
+
+                return {
+                    ...row,
+                    co2_mg: Number(co2Mg.toFixed(6)),
+                    cumulative_co2_mg: Number(cumulativeCo2Mg.toFixed(6))
+                };
+            });
+        }
+
+        function createLineChart(ctx, label, yTitle, borderColor, backgroundColor, fill = true) {
+            return new Chart(ctx, {
+                type: "line",
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: label,
+                        data: [],
+                        borderColor: borderColor,
+                        backgroundColor: backgroundColor,
+                        fill: fill,
+                        borderWidth: 3,
+                        pointRadius: 3,
+                        pointHoverRadius: 5,
+                        pointBackgroundColor: borderColor,
+                        pointBorderWidth: 0,
+                        tension: 0.35
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: "index", intersect: false },
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: "#234128",
+                                font: { family: "Inter", size: 13, weight: "700" }
+                            }
+                        },
+                        tooltip: {
+                            backgroundColor: "rgba(19, 27, 21, 0.96)",
+                            titleColor: "#ffffff",
+                            bodyColor: "#ffffff",
+                            padding: 12,
+                            cornerRadius: 12
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: "#6d7d71", maxTicksLimit: 8 },
+                            grid: { color: "rgba(84, 110, 88, 0.08)" }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            ticks: { color: "#6d7d71" },
+                            grid: { color: "rgba(84, 110, 88, 0.08)" },
+                            title: {
+                                display: true,
+                                text: yTitle,
+                                color: "#35533b",
+                                font: { family: "Inter", size: 13, weight: "700" }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function initCharts() {
+            const co2PpmCtx = document.getElementById("co2PpmTrendChart").getContext("2d");
+            const co2MgCtx = document.getElementById("co2CumulativeChart").getContext("2d");
+            const envCtx = document.getElementById("envTrendChart").getContext("2d");
+
+            const co2PpmGradient = co2PpmCtx.createLinearGradient(0, 0, 0, 360);
+            co2PpmGradient.addColorStop(0, "rgba(46, 125, 50, 0.35)");
+            co2PpmGradient.addColorStop(1, "rgba(46, 125, 50, 0.02)");
+
+            const co2MgGradient = co2MgCtx.createLinearGradient(0, 0, 0, 360);
+            co2MgGradient.addColorStop(0, "rgba(20, 100, 80, 0.35)");
+            co2MgGradient.addColorStop(1, "rgba(20, 100, 80, 0.02)");
+
+            co2PpmChart = createLineChart(
+                co2PpmCtx,
+                "CO₂ Concentration (ppm)",
+                "CO₂ Concentration (ppm)",
+                "#2e7d32",
+                co2PpmGradient,
+                true
+            );
+
+            co2CumulativeChart = createLineChart(
+                co2MgCtx,
+                "Cumulative CO₂ Production (mg)",
+                "Cumulative CO₂ Production (mg)",
+                "#146450",
+                co2MgGradient,
+                true
+            );
+
+            envChart = new Chart(envCtx, {
+                type: "line",
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: "Temperature (°C)",
+                            data: [],
+                            borderColor: "#f39c12",
+                            backgroundColor: "rgba(243, 156, 18, 0.08)",
+                            borderWidth: 3,
+                            pointRadius: 3,
+                            pointHoverRadius: 5,
+                            tension: 0.35,
+                            fill: false
+                        },
+                        {
+                            label: "Humidity (%)",
+                            data: [],
+                            borderColor: "#1e88e5",
+                            backgroundColor: "rgba(30, 136, 229, 0.08)",
+                            borderWidth: 3,
+                            pointRadius: 3,
+                            pointHoverRadius: 5,
+                            tension: 0.35,
+                            fill: false
+                        },
+                        {
+                            label: "Soil Moisture (%)",
+                            data: [],
+                            borderColor: "#43a047",
+                            backgroundColor: "rgba(67, 160, 71, 0.08)",
+                            borderWidth: 3,
+                            pointRadius: 3,
+                            pointHoverRadius: 5,
+                            tension: 0.35,
+                            fill: false
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: "index", intersect: false },
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: "#234128",
+                                font: { family: "Inter", size: 13, weight: "700" }
+                            }
+                        },
+                        tooltip: {
+                            backgroundColor: "rgba(19, 27, 21, 0.96)",
+                            titleColor: "#ffffff",
+                            bodyColor: "#ffffff",
+                            padding: 12,
+                            cornerRadius: 12
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: "#6d7d71", maxTicksLimit: 8 },
+                            grid: { color: "rgba(84, 110, 88, 0.08)" }
+                        },
+                        y: {
+                            ticks: { color: "#6d7d71" },
+                            grid: { color: "rgba(84, 110, 88, 0.08)" },
+                            title: {
+                                display: true,
+                                text: "Environmental Measurements",
+                                color: "#35533b",
+                                font: { family: "Inter", size: 13, weight: "700" }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateLatestUI(data) {
+            const temperature = Number(data.temperature ?? 0);
+            const humidity = Number(data.humidity ?? 0);
+            const soilPercent = Number(data.soil_moisture_percent ?? 0);
+            const soilRaw = data.soil_moisture_raw ?? "--";
+            const co2 = Number(data.co2 ?? 0);
+            const date = data.date ?? "--";
+            const time = data.time ?? "--";
+            const datetime = data.datetime ?? "--";
+
+            setText("co2", `${co2} ppm`);
+            setText("co2Label", `${co2} ppm`);
+
+            setText("temperature", `${temperature.toFixed(1)} °C`);
+            setText("temperatureLabel", `${temperature.toFixed(1)} °C`);
+
+            setText("humidity", `${humidity.toFixed(1)} %`);
+            setText("humidityLabel", `${humidity.toFixed(1)} %`);
+
+            setText("soilPercent", `${soilPercent} %`);
+            setText("soilPercentLabel", `${soilPercent} %`);
+
+            setText("soilRaw", soilRaw);
+            setText("deviceDate", date);
+            setText("deviceTime", time);
+            setText("lastSync", datetime);
+
+            setText("systemStatus", formatStatus(co2, temperature, humidity, soilPercent));
+
+            setBar("soilBar", soilPercent, `${soilPercent}%`);
+            setBar("humidityBar", Math.min(humidity, 100), `${humidity.toFixed(1)}%`);
+            setBar("tempBar", Math.min((temperature / 50) * 100, 100), `${temperature.toFixed(1)}°C`);
+            setBar("co2Bar", Math.min((co2 / 2000) * 100, 100), `${co2} ppm`);
+        }
+
+        function updateHistoryCharts(historyData) {
+            if (!historyData) return;
+
+            const entries = Object.entries(historyData).sort((a, b) => Number(a[0]) - Number(b[0]));
+
+            latestHistoryRows = entries.map(([key, value]) => ({
+                key,
+                datetime: value.datetime ?? key,
+                date: value.date ?? "",
+                time: value.time ?? "",
+                co2: Number(value.co2 ?? 0),
+                temperature: Number(value.temperature ?? 0),
+                humidity: Number(value.humidity ?? 0),
+                soil_moisture_percent: Number(value.soil_moisture_percent ?? 0),
+                soil_moisture_raw: Number(value.soil_moisture_raw ?? 0),
+                timestamp_unix: value.timestamp_unix ?? ""
+            }));
+
+            const calculatedRows = calculateCumulativeCo2Mg(latestHistoryRows);
+
+            const labels = calculatedRows.map(row => formatShortChartLabel(row, calculatedRows));
+
+            const co2PpmValues = calculatedRows.map(row => row.co2);
+            const cumulativeCo2MgValues = calculatedRows.map(row => row.cumulative_co2_mg);
+
+            const tempValues = calculatedRows.map(row => row.temperature);
+            const humidityValues = calculatedRows.map(row => row.humidity);
+            const soilValues = calculatedRows.map(row => row.soil_moisture_percent);
+
+            const latestCalculatedRow = calculatedRows[calculatedRows.length - 1];
+
+            if (latestCalculatedRow) {
+                setText("co2Mg", `${latestCalculatedRow.co2_mg.toFixed(6)} mg/min`);
+                setText("cumulativeCo2Mg", `${latestCalculatedRow.cumulative_co2_mg.toFixed(6)} mg`);
+            }
+
+            co2PpmChart.data.labels = labels;
+            co2PpmChart.data.datasets[0].data = co2PpmValues;
+            co2PpmChart.update();
+
+            co2CumulativeChart.data.labels = labels;
+            co2CumulativeChart.data.datasets[0].data = cumulativeCo2MgValues;
+            co2CumulativeChart.update();
+
+            envChart.data.labels = labels;
+            envChart.data.datasets[0].data = tempValues;
+            envChart.data.datasets[1].data = humidityValues;
+            envChart.data.datasets[2].data = soilValues;
+            envChart.update();
+
+            setText("historyCount", `${calculatedRows.length} records loaded`);
+        }
+
+        async function downloadCSV() {
+            try {
+                const snapshot = await get(fullHistoryRef);
+                const allHistory = snapshot.val();
+
+                if (!allHistory) {
+                    alert("No history data available to download.");
+                    return;
+                }
+
+                const rawRows = Object.entries(allHistory)
+                    .sort((a, b) => Number(a[0]) - Number(b[0]))
+                    .map(([key, value]) => ({
+                        key,
+                        datetime: value.datetime ?? key,
+                        date: value.date ?? "",
+                        time: value.time ?? "",
+                        co2: Number(value.co2 ?? 0),
+                        temperature: Number(value.temperature ?? 0),
+                        humidity: Number(value.humidity ?? 0),
+                        soil_moisture_percent: Number(value.soil_moisture_percent ?? 0),
+                        soil_moisture_raw: Number(value.soil_moisture_raw ?? 0),
+                        timestamp_unix: value.timestamp_unix ?? ""
+                    }));
+
+                const calculatedRows = calculateCumulativeCo2Mg(rawRows);
+
+                const rows = calculatedRows.map(row => ({
+                    datetime: row.datetime,
+                    date: row.date,
+                    time: row.time,
+                    co2_ppm: row.co2,
+                    co2_mg_per_minute: row.co2_mg,
+                    cumulative_co2_mg: row.cumulative_co2_mg,
+                    temperature: row.temperature,
+                    humidity: row.humidity,
+                    soil_moisture_percent: row.soil_moisture_percent,
+                    soil_moisture_raw: row.soil_moisture_raw,
+                    timestamp_unix: row.timestamp_unix
+                }));
+
+                const headers = [
+                    "datetime",
+                    "date",
+                    "time",
+                    "co2_ppm",
+                    "co2_mg_per_minute",
+                    "cumulative_co2_mg",
+                    "temperature",
+                    "humidity",
+                    "soil_moisture_percent",
+                    "soil_moisture_raw",
+                    "timestamp_unix"
+                ];
+
+                const csvLines = [
+                    headers.join(","),
+                    ...rows.map(row =>
+                        headers.map(header => `"${String(row[header] ?? "").replace(/"/g, '""')}"`).join(",")
+                    )
+                ];
+
+                const csvContent = csvLines.join("\n");
+                const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+                const url = URL.createObjectURL(blob);
+
+                const fileTimestamp = formatTimestampForFilename();
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `soil_respiration_full_history_${fileTimestamp}.csv`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                console.error("CSV download failed:", error);
+                alert("Failed to download CSV.");
+            }
+        }
+
+        window.addEventListener("DOMContentLoaded", () => {
+            initCharts();
+
+            document.getElementById("downloadCsvBtn").addEventListener("click", downloadCSV);
+
+            onValue(latestRef, (snapshot) => {
+                const data = snapshot.val();
+                if (data) updateLatestUI(data);
+            });
+
+            onValue(historyQuery, (snapshot) => {
+                const historyData = snapshot.val();
+
+                if (historyData) {
+                    updateHistoryCharts(historyData);
+                } else {
+                    latestHistoryRows = [];
+                    setText("historyCount", "0 records loaded");
+                    setText("co2Mg", "-- mg/min");
+                    setText("cumulativeCo2Mg", "-- mg");
+                }
+            });
+        });
+    </script>
+
+    <style>
+        :root {
+            --bg: #eef6eb;
+            --overlay: rgba(238, 246, 235, 0.88);
+            --glass: rgba(255, 255, 255, 0.72);
+            --glass-strong: rgba(255, 255, 255, 0.9);
+            --primary: #2e7d32;
+            --primary-dark: #1f5c24;
+            --text: #1d2c20;
+            --muted: #6b7b6e;
+            --border: rgba(71, 102, 77, 0.12);
+            --shadow-xl: 0 30px 70px rgba(28, 54, 33, 0.14);
+            --shadow-lg: 0 20px 40px rgba(28, 54, 33, 0.10);
+            --shadow-md: 0 12px 26px rgba(28, 54, 33, 0.08);
+            --radius-xl: 32px;
+            --radius-lg: 24px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: "Inter", sans-serif;
+        }
+
+        body {
+            min-height: 100vh;
+            color: var(--text);
+            background:
+                linear-gradient(var(--overlay), var(--overlay)),
+                url("https://images.unsplash.com/photo-1464226184884-fa280b87c399?q=80&w=1600&auto=format&fit=crop") center/cover no-repeat fixed;
+        }
+
+        .page {
+            min-height: 100vh;
+            backdrop-filter: blur(10px);
+            padding: 28px;
+        }
+
+        .container {
+            max-width: 1520px;
+            margin: 0 auto;
+        }
+
+        .hero {
+            border-radius: var(--radius-xl);
+            padding: 38px;
+            margin-bottom: 24px;
+            background: linear-gradient(135deg, rgba(23, 87, 31, 0.96), rgba(76, 145, 60, 0.92));
+            box-shadow: var(--shadow-xl);
+            color: #fff;
+        }
+
+        .hero-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 24px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .hero h1 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            letter-spacing: -0.04em;
+            margin-bottom: 10px;
+        }
+
+        .hero p {
+            font-size: 1rem;
+            line-height: 1.65;
+            max-width: 760px;
+            opacity: 0.96;
+        }
+
+        .hero-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 22px;
+        }
+
+        .pill {
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.14);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .hero-side {
+            min-width: 320px;
+            max-width: 360px;
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 22px;
+            padding: 18px;
+        }
+
+        .hero-side .label {
+            font-size: 0.82rem;
+            opacity: 0.84;
+            margin-bottom: 6px;
+        }
+
+        .hero-side .value {
+            font-size: 1rem;
+            font-weight: 700;
+            line-height: 1.5;
+            margin-bottom: 14px;
+        }
+
+        .download-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 12px 16px;
+            width: 100%;
+            border: none;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #ffd166, #f6a623);
+            color: #2f2410;
+            font-size: 0.95rem;
+            font-weight: 800;
+            cursor: pointer;
+            transition: 0.25s ease;
+        }
+
+        .download-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 28px rgba(246, 166, 35, 0.28);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+
+        .card {
+            background: var(--glass-strong);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            box-shadow: var(--shadow-md);
+        }
+
+        .card .title {
+            color: var(--muted);
+            font-size: 0.94rem;
+            font-weight: 700;
+            margin-bottom: 12px;
+        }
+
+        .card .value {
+            font-size: 1.6rem;
+            font-weight: 800;
+            color: var(--primary-dark);
+            margin-bottom: 8px;
+            word-break: break-word;
+        }
+
+        .card .meta {
+            color: #6f7f72;
+            font-size: 0.92rem;
+            line-height: 1.55;
+        }
+
+        .grid-graphs {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        .grid-2-graphs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1.4fr 1fr;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        .panel {
+            background: var(--glass);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 26px;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 18px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 18px;
+        }
+
+        .panel-header h2 {
+            font-size: 1.25rem;
+            font-weight: 800;
+            color: #24402a;
+            margin-bottom: 6px;
+        }
+
+        .panel-header p {
+            color: var(--muted);
+            font-size: 0.92rem;
+            line-height: 1.6;
+        }
+
+        .mini-tag {
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: rgba(46, 125, 50, 0.08);
+            color: var(--primary-dark);
+            font-size: 0.84rem;
+            font-weight: 700;
+            border: 1px solid rgba(46, 125, 50, 0.10);
+        }
+
+        .chart-wrap {
+            height: 390px;
+            padding: 16px;
+            border-radius: 20px;
+            background: linear-gradient(180deg, rgba(250, 253, 249, 0.98), rgba(243, 248, 241, 0.92));
+            border: 1px solid rgba(78, 108, 83, 0.10);
+        }
+
+        .status-stack,
+        .metrics {
+            display: grid;
+            gap: 16px;
+        }
+
+        .status-box {
+            background: linear-gradient(135deg, rgba(250, 253, 249, 0.98), rgba(245, 249, 243, 0.96));
+            border-left: 6px solid var(--primary);
+            border-radius: 18px;
+            padding: 18px 20px;
+        }
+
+        .status-box h3 {
+            font-size: 1rem;
+            font-weight: 800;
+            color: #224128;
+            margin-bottom: 8px;
+        }
+
+        .status-box p {
+            color: #5d705f;
+            line-height: 1.7;
+            font-size: 0.94rem;
+        }
+
+        .metric {
+            background: linear-gradient(180deg, rgba(250, 253, 249, 0.98), rgba(244, 249, 242, 0.96));
+            border: 1px solid rgba(88, 116, 90, 0.10);
+            border-radius: 18px;
+            padding: 16px;
+        }
+
+        .metric-title {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            color: #49604d;
+            font-size: 0.93rem;
+            font-weight: 700;
+        }
+
+        .bar-wrap {
+            width: 100%;
+            height: 18px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: #e6efe4;
+        }
+
+        .bar {
+            height: 100%;
+            border-radius: 999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-size: 0.78rem;
+            font-weight: 700;
+            min-width: 48px;
+        }
+
+        .soil-bar {
+            background: linear-gradient(90deg, #7f5327, #43a047);
+        }
+
+        .humidity-bar {
+            background: linear-gradient(90deg, #2196f3, #1565c0);
+        }
+
+        .temp-bar {
+            background: linear-gradient(90deg, #ffb74d, #f57c00);
+        }
+
+        .co2-bar {
+            background: linear-gradient(90deg, #7cb342, #2e7d32);
+        }
+
+        .formula-box {
+            background: rgba(46, 125, 50, 0.08);
+            border: 1px solid rgba(46, 125, 50, 0.12);
+            padding: 14px 16px;
+            border-radius: 16px;
+            color: #24402a;
+            font-size: 0.92rem;
+            line-height: 1.7;
+            margin-top: 14px;
+        }
+
+        .formula-box strong {
+            color: #1f5c24;
+        }
+
+        .footer {
+            text-align: center;
+            color: #647567;
+            font-size: 0.92rem;
+            padding: 6px 0 16px;
+        }
+
+        @media (max-width: 1350px) {
+            .stats-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+
+            .grid-2-graphs {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 1250px) {
+            .grid-2 {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 850px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 760px) {
+            .page {
+                padding: 16px;
+            }
+
+            .hero,
+            .panel,
+            .card {
+                padding: 20px;
+            }
+
+            .hero h1 {
+                font-size: 1.9rem;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .card .value {
+                font-size: 1.55rem;
+            }
+
+            .chart-wrap {
+                height: 300px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="page">
+        <div class="container">
+
+            <section class="hero">
+                <div class="hero-top">
+                    <div>
+                        <h1>Soil Respiration Monitoring Dashboard</h1>
+                        <p>
+                            Live monitoring of CO₂, soil moisture, outside temperature, and outside humidity.
+                            This dashboard shows both the raw CO₂ ppm trend and cumulative CO₂ production in mg.
+                        </p>
+
+                        <div class="hero-actions">
+                            <div class="pill">Persistent CO₂ ppm Trend</div>
+                            <div class="pill">Cumulative CO₂ mg Graph</div>
+                            <div class="pill">Environmental Multi-Line Graph</div>
+                            <div class="pill">Full CSV Download</div>
+                        </div>
+                    </div>
+
+                    <div class="hero-side">
+                        <div class="label">Last Data Sync</div>
+                        <div class="value" id="lastSync">Waiting for data...</div>
+
+                        <div class="label">History Window</div>
+                        <div class="value" id="historyCount">0 records loaded</div>
+
+                        <button id="downloadCsvBtn" class="download-btn">Download Full CSV</button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="stats-grid">
+                <div class="card">
+                    <div class="title">Carbon Dioxide</div>
+                    <div class="value" id="co2">-- ppm</div>
+                    <div class="meta">Live chamber CO₂ reading from the MH-Z19C sensor.</div>
+                </div>
+
+                <div class="card">
+                    <div class="title">CO₂ Produced</div>
+                    <div class="value" id="co2Mg">-- mg/min</div>
+                    <div class="meta">Minute-by-minute CO₂ increase converted from ppm to mg.</div>
+                </div>
+
+                <div class="card">
+                    <div class="title">Cumulative CO₂</div>
+                    <div class="value" id="cumulativeCo2Mg">-- mg</div>
+                    <div class="meta">Total accumulated CO₂ production from the loaded history window.</div>
+                </div>
+
+                <div class="card">
+                    <div class="title">Outside Temperature</div>
+                    <div class="value" id="temperature">-- °C</div>
+                    <div class="meta">Ambient temperature measured outside the chamber.</div>
+                </div>
+
+                <div class="card">
+                    <div class="title">Outside Humidity</div>
+                    <div class="value" id="humidity">-- %</div>
+                    <div class="meta">Relative humidity measured outside the chamber.</div>
+                </div>
+
+                <div class="card">
+                    <div class="title">Soil Moisture</div>
+                    <div class="value" id="soilPercent">-- %</div>
+                    <div class="meta">Percentage-converted soil moisture from the capacitive probe.</div>
+                </div>
+            </section>
+
+            <section class="grid-graphs">
+
+                <div class="grid-2-graphs">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div>
+                                <h2>Persistent CO₂ Trend</h2>
+                                <p>Raw CO₂ concentration trend from the latest Firebase history records.</p>
+                            </div>
+                            <div class="mini-tag">CO₂ ppm</div>
+                        </div>
+
+                        <div class="chart-wrap">
+                            <canvas id="co2PpmTrendChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div>
+                                <h2>Cumulative CO₂ Production</h2>
+                                <p>
+                                    CO₂ increase converted from ppm to mg and accumulated over time.
+                                </p>
+
+                                <div class="formula-box">
+                                    <strong>Formula:</strong>
+                                    CO₂ mg = (latest ppm - previous ppm) × 0.00126
+                                </div>
+                            </div>
+                            <div class="mini-tag">Cumulative mg</div>
+                        </div>
+
+                        <div class="chart-wrap">
+                            <canvas id="co2CumulativeChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <div>
+                            <h2>Environmental Multi-Line Trend</h2>
+                            <p>Temperature, humidity, and soil moisture over the same recent history window.</p>
+                        </div>
+                        <div class="mini-tag">Multi-Parameter View</div>
+                    </div>
+
+                    <div class="chart-wrap">
+                        <canvas id="envTrendChart"></canvas>
+                    </div>
+                </div>
+
+            </section>
+
+            <section class="grid-2">
+                <div class="panel">
+                    <div class="panel-header">
+                        <div>
+                            <h2>Sensor Activity Overview</h2>
+                            <p>Normalized visual indicators of the latest measurements.</p>
+                        </div>
+                    </div>
+
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-title">
+                                <span>Soil Moisture Level</span>
+                                <span id="soilPercentLabel">-- %</span>
+                            </div>
+                            <div class="bar-wrap">
+                                <div class="bar soil-bar" id="soilBar" style="width:0%">0%</div>
+                            </div>
+                        </div>
+
+                        <div class="metric">
+                            <div class="metric-title">
+                                <span>Outside Humidity</span>
+                                <span id="humidityLabel">-- %</span>
+                            </div>
+                            <div class="bar-wrap">
+                                <div class="bar humidity-bar" id="humidityBar" style="width:0%">0%</div>
+                            </div>
+                        </div>
+
+                        <div class="metric">
+                            <div class="metric-title">
+                                <span>Outside Temperature</span>
+                                <span id="temperatureLabel">-- °C</span>
+                            </div>
+                            <div class="bar-wrap">
+                                <div class="bar temp-bar" id="tempBar" style="width:0%">0°C</div>
+                            </div>
+                        </div>
+
+                        <div class="metric">
+                            <div class="metric-title">
+                                <span>CO₂ Level</span>
+                                <span id="co2Label">-- ppm</span>
+                            </div>
+                            <div class="bar-wrap">
+                                <div class="bar co2-bar" id="co2Bar" style="width:0%">0 ppm</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <div>
+                            <h2>System Status</h2>
+                            <p>Current state derived from the latest sensor readings.</p>
+                        </div>
+                    </div>
+
+                    <div class="status-stack">
+                        <div class="status-box">
+                            <h3>Operational Condition</h3>
+                            <p id="systemStatus">Waiting for live sensor data...</p>
+                        </div>
+
+                        <div class="status-box">
+                            <h3>Raw Soil Sensor Output</h3>
+                            <p>Analog Reading: <strong id="soilRaw">--</strong></p>
+                        </div>
+
+                        <div class="status-box">
+                            <h3>Date</h3>
+                            <p><strong id="deviceDate">--</strong></p>
+                        </div>
+
+                        <div class="status-box">
+                            <h3>Time</h3>
+                            <p><strong id="deviceTime">--</strong></p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <div class="footer">
+                Soil Respiration Monitoring System • ESP32 • Firebase Realtime Database
+            </div>
+
+        </div>
+    </div>
+</body>
+
+</html>
